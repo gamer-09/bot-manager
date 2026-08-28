@@ -1,0 +1,24 @@
+{
+  "name": "discord-bot-manager",
+  "version": "1.0.0",
+  "description": "Combined Discord bot manager - runs all 5 bots in one process",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --max-old-space-size=512 index.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop all",
+    "pm2:logs": "pm2 logs",
+    "pm2:monit": "pm2 monit"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7",
+    "minecraft-server-util": "^5.4.1",
+    "ws": "^8.18.0",
+    "express": "^5.2.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
