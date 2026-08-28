@@ -142,19 +142,24 @@ function fetchJSON(url) {
 async function getServerStatus(serverAddress) {
   // Robust raw status query: follows the Falix SRV record to the real server
   // node port and tolerates the modern (MOTD-less) status JSON that makes
-  // minecraft-server-util crash.
-  try {
-    const r = await rawMinecraftStatus(serverAddress);
-    const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
-    const version = (r.version?.name || '').toLowerCase();
-    if (!motd.includes('offline') && !version.includes('offline')) {
-      return { online: true, players: r.players?.online ?? 0, max: r.players?.max ?? 0, sample: r.players?.sample || [], version: r.version?.name || 'Unknown', latency: r.roundTripLatency };
-    }
-    // Server responded but says it is offline/paused (Falix idle server that
-    // auto-starts when a player joins). It is not accepting players, so report
-    // it as OFFLINE (with a paused hint).
-    return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
-  } catch { /* no direct response -> keep checking */ }
+  // minecraft-server-util crash. The Falix proxy can also transiently reply
+  // "Proxy busy — retry shortly" (0/0 players) when overloaded; retry a few times.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const r = await rawMinecraftStatus(serverAddress);
+      const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
+      const version = (r.version?.name || '').toLowerCase();
+      const busy = motd.includes('busy') || version.includes('busy');
+      if (busy) { await new Promise(r2 => setTimeout(r2, 600)); continue; }
+      if (!motd.includes('offline') && !version.includes('offline')) {
+        return { online: true, players: r.players?.online ?? 0, max: r.players?.max ?? 0, sample: r.players?.sample || [], version: r.version?.name || 'Unknown', latency: r.roundTripLatency };
+      }
+      // Server responded but says it is offline/paused (Falix idle server that
+      // auto-starts when a player joins). It is not accepting players, so report
+      // it as OFFLINE (with a paused hint).
+      return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
+    } catch { /* no direct response -> keep checking */ }
+  }
 
   // Fallback to the public mcsrvstat.us API.
   try {

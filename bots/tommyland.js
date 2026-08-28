@@ -231,28 +231,42 @@ async function start(token, options = {}) {
     // node port and tolerates the modern (MOTD-less) status JSON that makes
     // minecraft-server-util crash. It returns the full server info, or a Falix
     // "OFFLINE / join to auto-start" reply which is classified as paused below.
-    try {
-      const r = await rawMinecraftStatus(serverAddress);
-      const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
-      const ver = (r.version?.name || '').toLowerCase();
-      if (!motd.includes('offline') && !ver.includes('offline')) {
-        const result = {
-          online: true,
-          players: r.players?.online ?? 0,
-          max: r.players?.max ?? 0,
-          sample: r.players?.sample || [],
-          version: r.version?.name || 'Unknown',
-          latency: r.roundTripLatency,
-        };
-        lastKnownStatus = result;
-        return result;
-      }
-      // Server responded but says it is offline/paused (Falix idle server that
-      // auto-starts when a player joins). It is not accepting players, so report
-      // it as OFFLINE (with a paused hint).
-      return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
-    } catch {}
-
+    // The Falix proxy can also transiently reply "Proxy busy — retry shortly"
+    // (version shows that, 0/0 players) when overloaded; we retry a few times.
+    let lastErr = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await rawMinecraftStatus(serverAddress);
+        const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
+        const ver = (r.version?.name || '').toLowerCase();
+        const busy = motd.includes('busy') || ver.includes('busy');
+        if (busy) {
+          lastErr = new Error('busy');
+          await new Promise(r2 => setTimeout(r2, 600)); // brief backoff before retry
+          continue;
+        }
+        if (!motd.includes('offline') && !ver.includes('offline')) {
+          const result = {
+            online: true,
+            players: r.players?.online ?? 0,
+            max: r.players?.max ?? 0,
+            sample: r.players?.sample || [],
+            version: r.version?.name || 'Unknown',
+            latency: r.roundTripLatency,
+          };
+          lastKnownStatus = result;
+          return result;
+        }
+        // Server responded but says it is offline/paused (Falix idle server that
+        // auto-starts when a player joins). It is not accepting players, so report
+        // it as OFFLINE (with a paused hint).
+        return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
+      } catch (e) { lastErr = e; }
+    }
+    // If we only ever got "busy", fall back to the last known good status.
+    if (lastErr && lastErr.message === 'busy' && lastKnownStatus) {
+      return { ...lastKnownStatus, online: true, latency: null };
+    }
     // Server unreachable -> offline.
     return { online: false, players: 0, max: 0, sample: [], version: 'Unknown', latency: null, paused: false };
   }
