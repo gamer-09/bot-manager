@@ -21,7 +21,6 @@ const {
   ActionRowBuilder, ButtonBuilder, ButtonStyle,
   REST, Routes, SlashCommandBuilder,
 } = require('discord.js');
-const { status } = require('minecraft-server-util');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
@@ -78,6 +77,87 @@ function fetchJSON(url) {
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
     }).on('error', () => resolve(null)).on('timeout', function () { this.destroy(); resolve(null); });
   });
+}
+
+// ─── Robust raw Minecraft status query ─────────────────────────────────────
+// minecraft-server-util crashes on modern Falix servers (e.g. Minecraft 26.2 /
+// protocol 776) whose status JSON has NO `description`/MOTD field, throwing
+// "Unexpected server MOTD type: undefined". This queries the raw server-list
+// ping and parses the JSON manually, so the bot can read these servers.
+function _vint(n) { const b = []; while (true) { let x = n & 0x7F; n >>>= 7; if (n !== 0) x |= 0x80; b.push(x); if (n === 0) break; } return Buffer.from(b); }
+function _vstr(s) { const b = Buffer.from(s, "utf8"); return Buffer.concat([_vint(b.length), b]); }
+function _u16(n) { const b = Buffer.alloc(2); b.writeUInt16BE(n); return b; }
+function _stripColor(s) { return String(s).replace(/\u00a7[0-9a-fk-or]/gi, "").replace(/§[0-9a-fk-or]/gi, ""); }
+function _parseStatusResponse(buf) {
+  let i = 0;
+  while (i < buf.length && (buf[i] & 0x80)) i++; i++;
+  if (i >= buf.length) return null;
+  while (i < buf.length && (buf[i] & 0x80)) i++; i++;
+  if (i >= buf.length) return null;
+  let slen = 0, shift = 0;
+  while (i < buf.length) { const b = buf[i++]; slen |= (b & 0x7F) << shift; if (!(b & 0x80)) break; shift += 7; }
+  if (i + slen > buf.length) return null;
+  return JSON.parse(buf.slice(i, i + slen).toString("utf8"));
+}
+
+// Returns { host, port, sendHost } following the Falix SRV record (the real
+// server node port, e.g. 25537) instead of the shared proxy port 25565.
+async function resolveMinecraftTarget(serverAddress) {
+  const ip = process.env.SERVER_IP;
+  const mcPort = parseInt(process.env.MINECRAFT_PORT || process.env.MC_PORT, 10);
+  if (ip && Number.isInteger(mcPort) && mcPort > 0) return { host: ip, port: mcPort, sendHost: serverAddress };
+  try {
+    const srv = await dns.promises.resolveSrv('_minecraft._tcp.' + serverAddress);
+    if (srv && srv[0]) return { host: serverAddress, port: srv[0].port, sendHost: serverAddress };
+  } catch {}
+  return { host: serverAddress, port: 25565, sendHost: serverAddress };
+}
+
+// Resolves the correct host/port, performs a raw server-list ping, and returns a
+// normalized result shaped like the old minecraft-server-util result. Throws if
+// unreachable. A Falix "OFFLINE / join to auto-start" reply is still returned so
+// isActuallyOffline() can decide online vs offline.
+async function rawMinecraftStatus(serverAddress) {
+  const { host, port, sendHost } = await resolveMinecraftTarget(serverAddress);
+  const t0 = Date.now();
+  const data = await new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    let settled = false;
+    const sock = net.connect(port, host, () => {
+      try {
+        const hs = Buffer.concat([_vint(0), _vint(47), _vstr(sendHost), _u16(port), _vint(1)]);
+        sock.write(Buffer.concat([_vint(hs.length), hs]));
+        sock.write(Buffer.concat([_vint(1), _vint(0)]));
+      } catch (e) { fail(e); }
+    });
+    const timer = setTimeout(() => fail(new Error("Server is offline or unreachable")), 6000);
+    function fail(e) { if (settled) return; settled = true; clearTimeout(timer); try { sock.destroy(); } catch {} reject(e); }
+    sock.on("data", (d) => {
+      buf = Buffer.concat([buf, d]);
+      let parsed;
+      try { parsed = _parseStatusResponse(buf); } catch { return; }
+      if (!parsed) return;
+      settled = true; clearTimeout(timer); try { sock.destroy(); } catch {}
+      resolve(parsed);
+    });
+    sock.on("error", () => fail(new Error("Server is offline or unreachable")));
+  });
+  const players = data.players || {};
+  const sample = Array.isArray(players.sample) ? players.sample : null;
+  let cleanDesc = "";
+  const desc = data.description;
+  if (typeof desc === "string") cleanDesc = _stripColor(desc);
+  else if (desc && typeof desc === "object") {
+    try { cleanDesc = _stripColor((Array.isArray(desc) ? desc.map(c => c.text || "").join("") : desc.text) || ""); } catch { cleanDesc = ""; }
+  }
+  return {
+    online: true,
+    players: { online: players.online ?? 0, max: players.max ?? 0, sample },
+    version: { name: data.version?.name || "Unknown", protocol: data.version?.protocol },
+    motd: { clean: cleanDesc, raw: cleanDesc, html: "" },
+    roundTripLatency: Date.now() - t0,
+    sample,
+  };
 }
 
 function sendMgmtCommand(method, params = {}, config) {
@@ -147,64 +227,33 @@ async function start(token, options = {}) {
 
   // ─── Server Status (Falix-aware) ─────────────────────────────────────────
   async function getServerStatus(serverAddress) {
-    const { host, port } = await resolveServer(serverAddress);
-
-    // 1. Direct status ping (best case: full info).
-    //    Falix free servers answer the handshake with an "OFFLINE" motd/version
-    //    when they are asleep, so we can reliably distinguish asleep vs online.
+    // Robust raw status query: follows the Falix SRV record to the real server
+    // node port and tolerates the modern (MOTD-less) status JSON that makes
+    // minecraft-server-util crash. It returns the full server info, or a Falix
+    // "OFFLINE / join to auto-start" reply which is classified as paused below.
     try {
-      const r = await Promise.race([
-        status(host, port, { timeout: 4000 }),
-        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
-      ]);
-    const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
-    const ver = (r.version?.name || '').toLowerCase();
-    if (!motd.includes('offline') && !ver.includes('offline')) {
-      const result = {
-        online: true,
-        players: r.players?.online ?? 0,
-        max: r.players?.max ?? 0,
-        sample: r.players?.sample || [],
-        version: r.version?.name || 'Unknown',
-        latency: r.roundTripLatency,
-      };
-      lastKnownStatus = result;
-      return result;
-    }
-    // Server responded but says it is offline/paused (Falix idle server that
-    // auto-starts when a player joins). It is not accepting players, so report
-    // it as OFFLINE (with a paused hint).
-    return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
-  } catch { /* no direct response -> keep checking */ }
-
-    // 2. Fallback to the public mcsrvstat.us API (server may be slow / not
-    //    speaking the ping protocol to us directly). No `players.max` guard so we
-    //    still report online info when the server hides its max players.
-    try {
-      const data = await fetchJSON(`https://api.mcsrvstat.us/3/${host}:${port}`);
-      if (data?.online) {
+      const r = await rawMinecraftStatus(serverAddress);
+      const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
+      const ver = (r.version?.name || '').toLowerCase();
+      if (!motd.includes('offline') && !ver.includes('offline')) {
         const result = {
           online: true,
-          players: data.players?.online ?? 0,
-          max: data.players?.max ?? 0,
-          sample: (data.players?.list || []).map(p => ({ name: p })),
-          version: data.version || 'Unknown',
-          latency: null,
+          players: r.players?.online ?? 0,
+          max: r.players?.max ?? 0,
+          sample: r.players?.sample || [],
+          version: r.version?.name || 'Unknown',
+          latency: r.roundTripLatency,
         };
         lastKnownStatus = result;
         return result;
       }
+      // Server responded but says it is offline/paused (Falix idle server that
+      // auto-starts when a player joins). It is not accepting players, so report
+      // it as OFFLINE (with a paused hint).
+      return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
     } catch {}
 
-    // 3. TCP reachability (server reachable but not responding to ping protocol).
-    const reachable = await tcpPing(host, port, 2500);
-    if (reachable) {
-      // Reachable but not accepting the ping protocol -> treat as offline/idle.
-      if (lastKnownStatus) return { ...lastKnownStatus, online: false, latency: null, paused: true };
-      return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
-    }
-
-    // 4. Not reachable at all -> offline.
+    // Server unreachable -> offline.
     return { online: false, players: 0, max: 0, sample: [], version: 'Unknown', latency: null, paused: false };
   }
 
