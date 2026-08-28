@@ -46,7 +46,6 @@ function formatUptime(ms) {
 
 // ─── Server Status (Fast Falix-aware checker) ─────────────────────────────
 const dns = require('dns');
-dns.setServers(['8.8.8.8', '1.1.1.1']);
 const net = require('net');
 
 const srvCache = {};
@@ -70,27 +69,61 @@ function tcpPing(host, port, timeout = 3000) {
   });
 }
 
+function fetchJSON(url) {
+  return new Promise((resolve) => {
+    const urlObj = new URL(url);
+    https.get({
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      headers: { 'User-Agent': 'DiscordBot/1.0' },
+      timeout: 5000,
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
+    }).on('error', () => resolve(null)).on('timeout', function () { this.destroy(); resolve(null); });
+  });
+}
+
 async function getServerStatus(serverAddress) {
   const { host, port } = await resolveServer(serverAddress);
 
+  // 1. Direct status ping (best case: full info).
+  //    Falix free servers answer the handshake with an "OFFLINE" motd/version
+  //    when they are asleep, so we can reliably distinguish asleep vs online.
   try {
     const r = await Promise.race([
-      status(host, port, { timeout: 3000 }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
+      status(host, port, { timeout: 4000 }),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
     ]);
     const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
     const version = (r.version?.name || '').toLowerCase();
     if (!motd.includes('offline') && !version.includes('offline')) {
       return { online: true, players: r.players?.online ?? 0, max: r.players?.max ?? 0, sample: r.players?.sample || [], version: r.version?.name || 'Unknown', latency: r.roundTripLatency };
     }
+    // Server responded but says it is offline/paused (Falix idle server that
+    // auto-starts when a player joins). It is not accepting players, so report
+    // it as OFFLINE (with a paused hint).
+    return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
+  } catch { /* no direct response -> keep checking */ }
+
+  // 2. Fallback to the public mcsrvstat.us API so an online server is still
+  //    reported correctly even when the direct ping is slow/unavailable.
+  try {
+    const data = await fetchJSON(`https://api.mcsrvstat.us/3/${host}:${port}`);
+    if (data?.online) {
+      return { online: true, players: data.players?.online ?? 0, max: data.players?.max ?? 0, sample: (data.players?.list || []).map(p => ({ name: p })), version: data.version || 'Unknown', latency: null };
+    }
   } catch {}
 
-  const reachable = await tcpPing(host, port, 2000);
+  // 3. TCP reachability (server reachable but not speaking the ping protocol).
+  const reachable = await tcpPing(host, port, 2500);
   if (reachable) {
-    return { online: true, players: 0, max: 0, sample: [], version: 'Unknown (Paused/Sleeping)', latency: null };
+    return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
   }
 
-  return { online: false, players: 0, max: 0, sample: [], version: 'Unknown', latency: null };
+  // 4. Not reachable at all -> offline.
+  return { online: false, players: 0, max: 0, sample: [], version: 'Unknown', latency: null, paused: false };
 }
 
 // ─── Register Slash Commands ───────────────────────────────────────────────
@@ -218,7 +251,10 @@ async function start(token, options = {}) {
           ...(r.latency ? [{ name: 'Latency', value: `${r.latency}ms ${latencyBar(r.latency)}`, inline: true }] : []),
         ] })] });
       } else {
-        await message.reply({ embeds: [ui({ color: 0xED4245, title: '🔴 Server Offline', description: `Could not reach **${SERVER_ADDRESS}**.` })] });
+        const desc = r.paused
+          ? `**${SERVER_ADDRESS}** is currently offline/idle (0 players). It will auto-start when someone joins.`
+          : `Could not reach **${SERVER_ADDRESS}**.`;
+        await message.reply({ embeds: [ui({ color: 0xED4245, title: '🔴 Server Offline', description: desc })] });
       }
     } else if (command === 'ip') {
       await message.reply({ embeds: [ui({ color: 0x00CED1, title: '🌐 Server Address', description: `\`\`\`${SERVER_ADDRESS}\`\`\``, fields: [
@@ -272,7 +308,10 @@ async function start(token, options = {}) {
           ...(r.latency ? [{ name: 'Latency', value: `${r.latency}ms ${latencyBar(r.latency)}`, inline: true }] : []),
         ] })] });
       } else {
-        await interaction.editReply({ embeds: [ui({ color: 0xED4245, title: '🔴 Server Offline' })] });
+        const desc = r.paused
+          ? `**${SERVER_ADDRESS}** is currently offline/idle (0 players). It will auto-start when someone joins.`
+          : `Could not reach **${SERVER_ADDRESS}**.`;
+        await interaction.editReply({ embeds: [ui({ color: 0xED4245, title: '🔴 Server Offline', description: desc })] });
       }
     } else if (interaction.commandName === 'ip') {
       await interaction.reply({ embeds: [ui({ color: 0x00CED1, title: '🌐 Server Address', description: `\`\`\`${SERVER_ADDRESS}\`\`\`` })] });

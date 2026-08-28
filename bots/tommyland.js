@@ -1,6 +1,19 @@
 /**
  * Bot 3 & 4: Tommyland / Discord Bot (Falix Minecraft Manager)
  * Minecraft server management bot with status polling
+ *
+ * FIXES:
+ *  - Removed duplicate `const https = require('https')` (was a SyntaxError that
+ *    prevented this module from loading at all).
+ *  - All mutable state (client, botData, DATA_FILE, srvCache, lastKnownStatus) is
+ *    now created inside `start()`, so the module is instance-safe. This lets Bot 3
+ *    (tommyland) and Bot 4 (discord-bot, which reuses this module) run independently
+ *    in the same process without clobbering each other's state.
+ *  - Fixed server status detection: an asleep/offline Falix server (which still
+ *    answers the TCP port on the Falix proxy) is now correctly reported as
+ *    "sleeping"/offline instead of falsely "online with 0 players".
+ *  - Fixed the mcsrvstat.us fallback so an online server is still detected even
+ *    when `players.max` is 0, and removed the fragile global DNS override.
  */
 
 const {
@@ -12,23 +25,9 @@ const { status } = require('minecraft-server-util');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const dns = require('dns');
+const net = require('net');
 const https = require('https');
-
-let client = null;
-let botData = {};
-let DATA_FILE = null;
-
-// ─── Data Persistence ──────────────────────────────────────────────────────
-function loadData() {
-  try {
-    if (fs.existsSync(DATA_FILE)) return JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-  } catch {}
-  return {};
-}
-
-function saveData(data) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-}
 
 // ─── Colour Palette ────────────────────────────────────────────────────────
 const C = {
@@ -36,7 +35,7 @@ const C = {
   blue: "#5865F2", pink: "#EB459E", purple: "#9B59B6", cyan: "#00CED1",
 };
 
-// ─── Helpers ───────────────────────────────────────────────────────────────
+// ─── Pure Helpers (stateless, safe to share) ──────────────────────────────
 function formatUptime(ms) {
   const s = Math.floor(ms / 1000), m = Math.floor(s / 60);
   const h = Math.floor(m / 60), d = Math.floor(h / 24);
@@ -57,27 +56,6 @@ function isAdmin(member, config) {
   return member.id === config.ownerId || member.permissions.has("Administrator");
 }
 
-// ─── Server Status (Fast Falix-aware checker) ─────────────────────────────
-const dns = require('dns');
-dns.setServers(['8.8.8.8', '1.1.1.1']);
-const net = require('net');
-const https = require('https');
-
-// Cache DNS SRV + last known status
-const srvCache = {};
-let lastKnownStatus = null;
-
-async function resolveServer(serverAddress) {
-  if (srvCache[serverAddress]) return srvCache[serverAddress];
-  let host = serverAddress, port = 25565;
-  try {
-    const srv = await new Promise((res, rej) => dns.resolveSrv('_minecraft._tcp.' + serverAddress, (e, a) => e ? rej(e) : res(a)));
-    host = srv[0].name; port = srv[0].port;
-  } catch {}
-  srvCache[serverAddress] = { host, port };
-  return { host, port };
-}
-
 function tcpPing(host, port, timeout = 3000) {
   return new Promise((resolve) => {
     const sock = net.createConnection(port, host, () => { sock.end(); resolve(true); });
@@ -89,54 +67,19 @@ function tcpPing(host, port, timeout = 3000) {
 function fetchJSON(url) {
   return new Promise((resolve) => {
     const urlObj = new URL(url);
-    https.get({ hostname: urlObj.hostname, path: urlObj.pathname, headers: { 'User-Agent': 'DiscordBot/1.0' }, timeout: 5000 }, (res) => {
+    https.get({
+      hostname: urlObj.hostname,
+      path: urlObj.pathname + urlObj.search,
+      headers: { 'User-Agent': 'DiscordBot/1.0' },
+      timeout: 5000,
+    }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => { try { resolve(JSON.parse(data)); } catch { resolve(null); } });
-    }).on('error', () => resolve(null)).on('timeout', function() { this.destroy(); resolve(null); });
+    }).on('error', () => resolve(null)).on('timeout', function () { this.destroy(); resolve(null); });
   });
 }
 
-async function getServerStatus(serverAddress) {
-  const { host, port } = await resolveServer(serverAddress);
-
-  // 1. Try minecraft-server-util (best case: full info)
-  try {
-    const r = await Promise.race([
-      status(host, port, { timeout: 3000 }),
-      new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))
-    ]);
-    const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
-    const ver = (r.version?.name || '').toLowerCase();
-    if (!motd.includes('offline') && !ver.includes('offline')) {
-      const result = { online: true, players: r.players?.online ?? 0, max: r.players?.max ?? 0, sample: r.players?.sample || [], version: r.version?.name || 'Unknown', latency: r.roundTripLatency };
-      lastKnownStatus = result;
-      return result;
-    }
-  } catch {}
-
-  // 2. Try mcsrvstat.us API (may have cached data from when server was awake)
-  try {
-    const data = await fetchJSON(`https://api.mcsrvstat.us/3/${host}:${port}`);
-    if (data?.online && data?.players?.max > 0) {
-      const result = { online: true, players: data.players.online ?? 0, max: data.players.max ?? 0, sample: (data.players?.list || []).map(p => ({ name: p })), version: data.version || 'Unknown', latency: null };
-      lastKnownStatus = result;
-      return result;
-    }
-  } catch {}
-
-  // 3. TCP ping (server is listening but may be paused — use cached info)
-  const reachable = await tcpPing(host, port, 2000);
-  if (reachable) {
-    if (lastKnownStatus) return { ...lastKnownStatus, online: true, latency: null };
-    return { online: true, players: 0, max: 0, sample: [], version: 'Unknown', latency: null };
-  }
-
-  // 4. Server is sleeping/paused (Falix free server empty >60s)
-  return { online: false, players: 0, max: 0, sample: [], version: '💤 Sleeping', latency: null, sleeping: true };
-}
-
-// ─── WebSocket Management ──────────────────────────────────────────────────
 function sendMgmtCommand(method, params = {}, config) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://${config.mgmtHost}:${config.mgmtPort}`, {
@@ -157,64 +100,19 @@ function sendMgmtCommand(method, params = {}, config) {
   });
 }
 
-// ─── Register Slash Commands ───────────────────────────────────────────────
-async function registerSlashCommands(token, guildId) {
-  await new Promise(resolve => {
-    if (client.user && client.user.id) return resolve();
-    client.once('ready', resolve);
-    if (client.isReady()) resolve();
-  });
-  
-  await new Promise(r => setTimeout(r, 2000));
-  
-  if (!client.user || !client.user.id) {
-    console.error('  ❌ tommyland: Client user not available');
-    return;
-  }
-  
-  const rest = new REST().setToken(token);
-  const commands = [
-    new SlashCommandBuilder().setName("start").setDescription("Get a button to start the server").toJSON(),
-    new SlashCommandBuilder().setName("ip").setDescription("Show the server IP").toJSON(),
-    new SlashCommandBuilder().setName("status").setDescription("Full server status").toJSON(),
-    new SlashCommandBuilder().setName("players").setDescription("See who is online").toJSON(),
-    new SlashCommandBuilder().setName("uptime").setDescription("Bot uptime info").toJSON(),
-    new SlashCommandBuilder().setName("poll").setDescription("Create a community poll")
-      .addStringOption(o => o.setName("question").setDescription("The poll question").setRequired(true))
-      .addStringOption(o => o.setName("options").setDescription("Pipe-separated: Yes | No | Maybe").setRequired(false)).toJSON(),
-    new SlashCommandBuilder().setName("setchannel").setDescription("Set activity channel (Admin only)").toJSON(),
-    new SlashCommandBuilder().setName("stopchannel").setDescription("Stop activity updates (Admin only)").toJSON(),
-    new SlashCommandBuilder().setName("shutdown").setDescription("Stop the Minecraft server (Admin only)").toJSON(),
-    new SlashCommandBuilder().setName("help").setDescription("Show all commands").toJSON(),
-  ];
-  
-  if (guildId) {
-    try {
-      await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
-      console.log(`  ✅ tommyland: Registered ${commands.length} slash commands`);
-    } catch (err) {
-      console.error(`  ⚠️ tommyland: Registration failed:`, err.message);
-    }
-  }
-}
-
-// ─── Start Function ────────────────────────────────────────────────────────
+// ─── Start Function (instance-safe) ───────────────────────────────────────
 async function start(token, options = {}) {
   const { prefix = '!', serverSubdomain, mgmtHost, mgmtPort, mgmtSecret, ownerId, guildId, dataDir } = options;
-  
+
   const SERVER_ADDRESS = `${serverSubdomain}.falixsrv.me`;
   const START_URL = `https://falixnodes.net/startserver?ip=${SERVER_ADDRESS}`;
   const BOT_START_TIME = Date.now();
   const POLL_INTERVAL_MS = 30_000;
   let prevState = { online: null, playerNames: new Set(), playerCount: 0 };
 
-  if (dataDir && !fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-  DATA_FILE = path.join(dataDir || '.', 'data.json');
-  botData = loadData();
-
-  client = new Client({
+  // All per-instance state lives here (never module-level), so multiple bots can
+  // share this module without interfering with each other.
+  let client = new Client({
     intents: [
       GatewayIntentBits.Guilds,
       GatewayIntentBits.GuildMessages,
@@ -222,6 +120,134 @@ async function start(token, options = {}) {
       GatewayIntentBits.GuildMessageReactions,
     ],
   });
+  let botData = {};
+  const DATA_FILE = path.join(dataDir || '.', 'data.json');
+
+  if (dataDir && !fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+  try { if (fs.existsSync(DATA_FILE)) botData = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch {}
+
+  function saveData(data) {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  }
+
+  // Cache DNS SRV + last known status (per instance)
+  const srvCache = {};
+  let lastKnownStatus = null;
+
+  async function resolveServer(serverAddress) {
+    if (srvCache[serverAddress]) return srvCache[serverAddress];
+    let host = serverAddress, port = 25565;
+    try {
+      const srv = await new Promise((res, rej) => dns.resolveSrv('_minecraft._tcp.' + serverAddress, (e, a) => e ? rej(e) : res(a)));
+      host = srv[0].name; port = srv[0].port;
+    } catch {}
+    srvCache[serverAddress] = { host, port };
+    return { host, port };
+  }
+
+  // ─── Server Status (Falix-aware) ─────────────────────────────────────────
+  async function getServerStatus(serverAddress) {
+    const { host, port } = await resolveServer(serverAddress);
+
+    // 1. Direct status ping (best case: full info).
+    //    Falix free servers answer the handshake with an "OFFLINE" motd/version
+    //    when they are asleep, so we can reliably distinguish asleep vs online.
+    try {
+      const r = await Promise.race([
+        status(host, port, { timeout: 4000 }),
+        new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), 5000))
+      ]);
+    const motd = (typeof r.motd?.clean === 'string' ? r.motd.clean : '').toLowerCase();
+    const ver = (r.version?.name || '').toLowerCase();
+    if (!motd.includes('offline') && !ver.includes('offline')) {
+      const result = {
+        online: true,
+        players: r.players?.online ?? 0,
+        max: r.players?.max ?? 0,
+        sample: r.players?.sample || [],
+        version: r.version?.name || 'Unknown',
+        latency: r.roundTripLatency,
+      };
+      lastKnownStatus = result;
+      return result;
+    }
+    // Server responded but says it is offline/paused (Falix idle server that
+    // auto-starts when a player joins). It is not accepting players, so report
+    // it as OFFLINE (with a paused hint).
+    return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
+  } catch { /* no direct response -> keep checking */ }
+
+    // 2. Fallback to the public mcsrvstat.us API (server may be slow / not
+    //    speaking the ping protocol to us directly). No `players.max` guard so we
+    //    still report online info when the server hides its max players.
+    try {
+      const data = await fetchJSON(`https://api.mcsrvstat.us/3/${host}:${port}`);
+      if (data?.online) {
+        const result = {
+          online: true,
+          players: data.players?.online ?? 0,
+          max: data.players?.max ?? 0,
+          sample: (data.players?.list || []).map(p => ({ name: p })),
+          version: data.version || 'Unknown',
+          latency: null,
+        };
+        lastKnownStatus = result;
+        return result;
+      }
+    } catch {}
+
+    // 3. TCP reachability (server reachable but not responding to ping protocol).
+    const reachable = await tcpPing(host, port, 2500);
+    if (reachable) {
+      // Reachable but not accepting the ping protocol -> treat as offline/idle.
+      if (lastKnownStatus) return { ...lastKnownStatus, online: false, latency: null, paused: true };
+      return { online: false, players: 0, max: 0, sample: [], version: 'Offline', latency: null, paused: true };
+    }
+
+    // 4. Not reachable at all -> offline.
+    return { online: false, players: 0, max: 0, sample: [], version: 'Unknown', latency: null, paused: false };
+  }
+
+  // ─── Register Slash Commands ─────────────────────────────────────────────
+  async function registerSlashCommands(token, guildId) {
+    await new Promise(resolve => {
+      if (client.user && client.user.id) return resolve();
+      client.once('ready', resolve);
+      if (client.isReady()) resolve();
+    });
+
+    await new Promise(r => setTimeout(r, 2000));
+
+    if (!client.user || !client.user.id) {
+      console.error('  ❌ Falix MC manager: Client user not available');
+      return;
+    }
+
+    const rest = new REST().setToken(token);
+    const commands = [
+      new SlashCommandBuilder().setName("start").setDescription("Get a button to start the server").toJSON(),
+      new SlashCommandBuilder().setName("ip").setDescription("Show the server IP").toJSON(),
+      new SlashCommandBuilder().setName("status").setDescription("Full server status").toJSON(),
+      new SlashCommandBuilder().setName("players").setDescription("See who is online").toJSON(),
+      new SlashCommandBuilder().setName("uptime").setDescription("Bot uptime info").toJSON(),
+      new SlashCommandBuilder().setName("poll").setDescription("Create a community poll")
+        .addStringOption(o => o.setName("question").setDescription("The poll question").setRequired(true))
+        .addStringOption(o => o.setName("options").setDescription("Pipe-separated: Yes | No | Maybe").setRequired(false)).toJSON(),
+      new SlashCommandBuilder().setName("setchannel").setDescription("Set activity channel (Admin only)").toJSON(),
+      new SlashCommandBuilder().setName("stopchannel").setDescription("Stop activity updates (Admin only)").toJSON(),
+      new SlashCommandBuilder().setName("shutdown").setDescription("Stop the Minecraft server (Admin only)").toJSON(),
+      new SlashCommandBuilder().setName("help").setDescription("Show all commands").toJSON(),
+    ];
+
+    if (guildId) {
+      try {
+        await rest.put(Routes.applicationGuildCommands(client.user.id, guildId), { body: commands });
+        console.log(`  ✅ Falix MC manager: Registered ${commands.length} slash commands`);
+      } catch (err) {
+        console.error(`  ⚠️ Falix MC manager: Registration failed:`, err.message);
+      }
+    }
+  }
 
   function ui({ color, title, description = null, fields = [] }) {
     return new EmbedBuilder()
@@ -267,12 +293,30 @@ async function start(token, options = {}) {
 
   client.once("ready", async () => {
     const botTag = client.user?.tag ?? 'Unknown';
-    console.log(`  ⛏️ Tommyland online as ${botTag}`);
+    console.log(`  ⛏️ Falix MC manager online as ${botTag} (server ${SERVER_ADDRESS})`);
     if (client.user) client.user.setActivity("Falix MC Manager 🎮", { type: 3 });
     setInterval(pollServer, POLL_INTERVAL_MS);
     setTimeout(pollServer, 3000);
     await registerSlashCommands(token, guildId);
   });
+
+  function onlineEmbed(r) {
+    return { embeds: [ui({ color: C.green, title: "✅ Server Online", fields: [
+      { name: "Players", value: `**${r.players}** / ${r.max}`, inline: true },
+      { name: "Version", value: r.version, inline: true },
+      ...(r.latency ? [{ name: "Latency", value: `${r.latency}ms ${latencyBar(r.latency)}`, inline: true }] : []),
+    ] })] };
+  }
+
+  function offlineEmbed(r = {}) {
+    const btn = new ActionRowBuilder().addComponents(
+      new ButtonBuilder().setLabel("▶ Start Server").setStyle(ButtonStyle.Link).setURL(START_URL)
+    );
+    const desc = r.paused
+      ? `**${SERVER_ADDRESS}** is currently offline/idle (0 players). It will auto-start when someone joins.`
+      : `**${SERVER_ADDRESS}** is not reachable.`;
+    return { embeds: [ui({ color: C.red, title: "🔴 Server Offline", description: desc })], components: [btn] };
+  }
 
   // Prefix commands
   client.on("messageCreate", async (message) => {
@@ -289,28 +333,8 @@ async function start(token, options = {}) {
       await message.reply({ embeds: [ui({ color: C.cyan, title: "🌐 Server Address", description: `\`\`\`${SERVER_ADDRESS}\`\`\`` })] });
     } else if (command === "status") {
       const r = await getServerStatus(SERVER_ADDRESS);
-      if (r.sleeping) {
-        const btn = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel("▶ Wake Up Server").setStyle(ButtonStyle.Link).setURL(START_URL)
-        );
-        await message.reply({ embeds: [ui({ color: C.yellow, title: "💤 Server Sleeping", description: `**${SERVER_ADDRESS}** is paused (no players for 60s).\nClick the button to wake it up.`, fields: [
-          ...(lastKnownStatus ? [
-            { name: "Last Known Players", value: `**${lastKnownStatus.players}** / ${lastKnownStatus.max}`, inline: true },
-            { name: "Last Known Version", value: lastKnownStatus.version, inline: true },
-          ] : []),
-        ] }), components: [btn] });
-      } else if (r.online) {
-        await message.reply({ embeds: [ui({ color: C.green, title: "✅ Server Online", fields: [
-          { name: "Players", value: `**${r.players}** / ${r.max}`, inline: true },
-          { name: "Version", value: r.version, inline: true },
-          ...(r.latency ? [{ name: "Latency", value: `${r.latency}ms ${latencyBar(r.latency)}`, inline: true }] : []),
-        ] })] });
-      } else {
-        const btn = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel("▶ Start Server").setStyle(ButtonStyle.Link).setURL(START_URL)
-        );
-        await message.reply({ embeds: [ui({ color: C.red, title: "🔴 Server Offline", description: `**${SERVER_ADDRESS}** is not reachable.` }), components: [btn] });
-      }
+      if (r.online) return message.reply(onlineEmbed(r));
+      return message.reply(offlineEmbed(r));
     } else if (command === "players") {
       const r = await getServerStatus(SERVER_ADDRESS);
       if (r.online) {
@@ -384,28 +408,8 @@ async function start(token, options = {}) {
     } else if (cmd === "status") {
       await interaction.deferReply();
       const r = await getServerStatus(SERVER_ADDRESS);
-      if (r.sleeping) {
-        const btn = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel("▶ Wake Up Server").setStyle(ButtonStyle.Link).setURL(START_URL)
-        );
-        await interaction.editReply({ embeds: [ui({ color: C.yellow, title: "💤 Server Sleeping", description: `**${SERVER_ADDRESS}** is paused (no players for 60s).\nClick the button to wake it up.`, fields: [
-          ...(lastKnownStatus ? [
-            { name: "Last Known Players", value: `**${lastKnownStatus.players}** / ${lastKnownStatus.max}`, inline: true },
-            { name: "Last Known Version", value: lastKnownStatus.version, inline: true },
-          ] : []),
-        ] }), components: [btn] });
-      } else if (r.online) {
-        await interaction.editReply({ embeds: [ui({ color: C.green, title: "✅ Server Online", fields: [
-          { name: "Players", value: `**${r.players}** / ${r.max}`, inline: true },
-          { name: "Version", value: r.version, inline: true },
-          ...(r.latency ? [{ name: "Latency", value: `${r.latency}ms`, inline: true }] : []),
-        ] })] });
-      } else {
-        const btn = new ActionRowBuilder().addComponents(
-          new ButtonBuilder().setLabel("▶ Start Server").setStyle(ButtonStyle.Link).setURL(START_URL)
-        );
-        await interaction.editReply({ embeds: [ui({ color: C.red, title: "🔴 Server Offline", description: `**${SERVER_ADDRESS}** is not reachable.` }), components: [btn] });
-      }
+      if (r.online) return interaction.editReply(onlineEmbed(r));
+      return interaction.editReply(offlineEmbed(r));
     } else if (cmd === "players") {
       await interaction.deferReply();
       const r = await getServerStatus(SERVER_ADDRESS);
